@@ -1,0 +1,29 @@
+services:
+  nats:
+    image: nats:2.10
+    command: ["-js", "-m", "8222", "-p", "4222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  test:
+    image: golang:1.25.5
+    working_dir: /app
+    volumes:
+      - ./:/app
+      # Persist Go caches across `docker compose run --rm test` invocations
+      - gocache:/root/.cache/go-build
+      - gomodcache:/go/pkg/mod
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_MON_URL: http://nats:8222/varz
+      # Ensure caches are used at these mounted paths
+      GOMODCACHE: /go/pkg/mod
+      GOCACHE: /root/.cache/go-build
+    depends_on:
+      - nats
+    command: ["sh", "-c", "./scripts/test.sh"]
+
+volumes:
+  gocache:
+  gomodcache:
