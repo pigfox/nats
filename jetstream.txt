@@ -1,0 +1,177 @@
+JetStream is NATS’s built-in persistence layer. Plain NATS “core” is fire-and-forget
+pub/sub (messages are not stored). JetStream adds:
+
+- Durable storage of messages in a stream (memory or disk)
+- At-least-once delivery with explicit acknowledgements (acks) and redelivery
+- Replay and catch-up (consume from the beginning, from a point in time, etc.)
+- Backpressure and flow control via consumer limits (ack pending, max deliver, etc.)
+
+================================================================
+CORE CONCEPTS
+================================================================
+
+----------------------------------------------------------------
+Stream
+----------------------------------------------------------------
+A stream is an append-only log of messages for one or more subjects.
+
+- Configuration ties it to subjects, retention policy, storage type,
+  max age, size limits, etc.
+- Conceptually similar to a Kafka topic (not identical, but close enough
+  for intuition).
+
+In your code:
+- EnsureStream(...) creates or updates a stream for the subject(s)
+  you publish to.
+
+----------------------------------------------------------------
+Consumer
+----------------------------------------------------------------
+A consumer is a view/reader over a stream. It tracks what has been delivered
+and what has been acknowledged.
+
+Important consumer settings you’re using:
+
+- Durable
+  A named consumer that keeps state on the server.
+  Offset/ack state survives reconnects and restarts.
+
+- FilterSubject
+  Only deliver messages matching this subject.
+  Must match what you fetch, or the server will reject delivery.
+
+- AckPolicy = explicit
+  The server requires you to acknowledge each message.
+  If you don’t ack, the message can be redelivered.
+
+- AckWait
+  How long the server waits for an ack before considering the message
+  unprocessed and eligible for redelivery.
+
+- MaxDeliver
+  Maximum number of delivery attempts before the message is considered failed
+  for that consumer.
+
+- MaxAckPending
+  Limits the number of in-flight, unacknowledged messages.
+  This is a key backpressure control.
+
+- DeliverPolicy
+  Determines where consumption starts:
+    - all: start from the earliest available message
+    - others exist (new, last, by sequence, by time, etc.)
+
+----------------------------------------------------------------
+Message acknowledgement (Ack)
+----------------------------------------------------------------
+With AckPolicy = explicit:
+
+- After your handler receives a message, it must call Ack().
+- If you ack:
+    The message is marked processed for that consumer.
+- If you do not ack within AckWait:
+    The message becomes eligible for redelivery.
+- If your handler crashes mid-processing:
+    It won’t ack, so the message will be delivered again.
+
+This is the core reliability mechanism that gives JetStream
+at-least-once delivery semantics.
+
+================================================================
+PUSH VS PULL CONSUMERS
+================================================================
+
+JetStream supports two delivery styles:
+
+- Push consumer
+  The server pushes messages to your subscription.
+  Callback-driven, similar to core NATS.
+
+- Pull consumer
+  The client explicitly fetches batches of messages.
+
+Your wrapper uses durable pull consumers:
+
+- You create a durable consumer (EnsureDurablePullConsumer).
+- You call Fetch(batch, maxWait) to pull messages.
+- You explicitly Ack() each message.
+
+Pull consumers are often easier to control in services because you can:
+
+- Tune batch size and wait time.
+- Implement your own concurrency model.
+- Apply backpressure naturally.
+
+================================================================
+WHAT YOUR WRAPPER IS DOING (PRACTICAL FLOW)
+================================================================
+
+1) EnsureStream(stream, subjects...)
+   Guarantees the server is storing messages for your subject(s).
+
+2) Publish(subject, data)
+   Writes a message into the stream (persisted).
+
+3) EnsureDurablePullConsumer(stream, durable, filterSubject, ...)
+   Creates a durable reader that tracks consumption progress.
+
+4) Fetch(stream, durable, filterSubject, batch, maxWait)
+   Asks the server:
+   “Give me up to N unprocessed messages for this consumer.”
+   Returns messages that must be acknowledged.
+
+5) Ack()
+   Confirms processing of each message.
+
+================================================================
+WHEN TO USE JETSTREAM VS CORE NATS
+================================================================
+
+Use core NATS when:
+- Best-effort delivery is acceptable.
+- Losing messages is not a big deal (telemetry, ephemeral signals).
+- You don’t need replay or persistence.
+- You want the lowest latency and simplest semantics.
+
+Use JetStream when:
+- Losing messages is unacceptable.
+- Consumers may be down and need to catch up.
+- You need retries and redelivery.
+- You want auditability or replay.
+- You need durable work queues or event logs.
+
+================================================================
+TYPICAL JETSTREAM PATTERNS
+================================================================
+
+----------------------------------------------------------------
+Event log / audit stream
+----------------------------------------------------------------
+- Stream retention by time or size.
+- Multiple consumers, each with its own durable state.
+- Ideal for events like:
+  “user.created”, “payment.posted”, etc.
+
+----------------------------------------------------------------
+Work queue
+----------------------------------------------------------------
+- One logical consumer group pulls tasks and acks when done.
+- If a worker dies, tasks are redelivered.
+- Use MaxAckPending to cap in-flight tasks.
+- Use MaxDeliver plus a dead-letter strategy
+  (often a separate stream/subject for failures).
+
+================================================================
+COMMON FOOTGUNS
+================================================================
+
+- FilterSubject must match the consumer configuration.
+  If the stream or consumer filter is `events.foo` but you fetch or consume
+  `events.bar`, you will see:
+  “subject does not match consumer”.
+
+- Always Flush() after setting up subscriptions in tests.
+  This ensures server-side registration before publishing.
+
+- Keep AckWait and MaxDeliver aligned with worst-case processing time.
+  If processing regularly exceeds AckWait, you will see duplicate deliveries.
